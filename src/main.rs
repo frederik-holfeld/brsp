@@ -225,9 +225,25 @@ fn main() {
 }
 
 fn handle_client(mut client: TcpStream, brpy: PathBuf) {
+    let mut initialized = false;
+
     loop {
         let mut len = [0; 1];
-        client.read_exact(&mut len).unwrap();
+
+        match client.read_exact(&mut len) {
+            Ok(_) => {}
+            Err(error) => {
+                if initialized {
+                    println!("Client disconnected");
+                    return;
+                } else {
+                    panic!(
+                        "Connection broken right after it was established: {}",
+                        error
+                    );
+                }
+            }
+        }
 
         let mut header = vec![0; len[0] as usize];
         client.read_exact(&mut header).unwrap();
@@ -342,5 +358,7 @@ fn handle_client(mut client: TcpStream, brpy: PathBuf) {
                 todo!();
             }
         }
+
+        initialized = true;
     }
 }
