@@ -27,7 +27,7 @@ enum Command {
         ip: SocketAddr,
         output_dir: PathBuf,
         id: String,
-        frame: usize,
+        frames: String,
     },
     Delete,
     Serve {
@@ -113,35 +113,67 @@ fn main() {
             ip,
             output_dir,
             id,
-            frame,
+            frames,
         } => {
             set_current_dir(output_dir).unwrap();
 
-            let mut header = serde_json::to_vec(&Request::Render { id, frame }).unwrap();
-            let mut request = vec![header.len().try_into().unwrap()];
-            request.append(&mut header);
+            let frames = {
+                let mut list = Vec::new();
+
+                for range in frames.split_terminator(',') {
+                    let frame = range.parse::<usize>();
+                    match frame {
+                        Ok(frame) => {
+                            list.push(frame);
+                        }
+                        Err(_) => {
+                            let range: Vec<&str> = range.split_terminator("..").collect();
+                            let start: usize = range[0].parse().unwrap();
+                            let end: usize = range[1].parse().unwrap();
+
+                            list.append(&mut (start..=end).collect());
+                        }
+                    }
+                }
+
+                list.sort();
+                list.dedup();
+                list
+            };
 
             let mut server = TcpStream::connect(ip).unwrap();
-            server.write_all(&request).unwrap();
 
-            let mut len = [0; 1];
-            server.read_exact(&mut len).unwrap();
+            for frame in frames {
+                let mut header = serde_json::to_vec(&Request::Render {
+                    id: id.clone(),
+                    frame,
+                })
+                .unwrap();
 
-            let mut header = vec![0; len[0] as usize];
-            server.read_exact(&mut header).unwrap();
+                let mut request = vec![header.len().try_into().unwrap()];
+                request.append(&mut header);
 
-            let header = serde_json::from_slice(&header).unwrap();
-            match header {
-                RenderResponse::Okay { size, extension } => {
-                    let mut image = vec![0; size];
-                    server.read_exact(&mut image).unwrap();
+                server.write_all(&request).unwrap();
 
-                    let image_name = format!("{:04}.{}", frame, extension);
-                    write(&image_name, image).unwrap();
-                    println!("Saved frame as {}", image_name);
-                }
-                RenderResponse::Fail => {
-                    todo!();
+                let mut len = [0; 1];
+                server.read_exact(&mut len).unwrap();
+
+                let mut header = vec![0; len[0] as usize];
+                server.read_exact(&mut header).unwrap();
+
+                let header = serde_json::from_slice(&header).unwrap();
+                match header {
+                    RenderResponse::Okay { size, extension } => {
+                        let mut image = vec![0; size];
+                        server.read_exact(&mut image).unwrap();
+
+                        let image_name = format!("{:04}.{}", frame, extension);
+                        write(&image_name, image).unwrap();
+                        println!("Saved frame {} as {}", frame, image_name);
+                    }
+                    RenderResponse::Fail => {
+                        todo!();
+                    }
                 }
             }
         }
@@ -305,7 +337,6 @@ fn handle_client(mut client: TcpStream, brpy: PathBuf) {
                 let _ = process.wait();
 
                 println!("Rendered frame {} of \"{}\" sent to client", frame, id);
-                break;
             }
             Request::Delete => {
                 todo!();
