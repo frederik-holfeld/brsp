@@ -5,7 +5,7 @@ use std::{
     fs::{create_dir, read, write},
     hash::{DefaultHasher, Hash, Hasher},
     io::{ErrorKind::AlreadyExists, Read, Write},
-    net::{SocketAddr, TcpListener, TcpStream},
+    net::{Ipv6Addr, SocketAddr, TcpListener, TcpStream},
     path::PathBuf,
     process, thread,
 };
@@ -196,9 +196,9 @@ fn main() {
                 }
             }
 
-            let listener = match TcpListener::bind("0.0.0.0:21816") {
+            let listener = match TcpListener::bind((Ipv6Addr::UNSPECIFIED, 21816)) {
                 Ok(listener) => listener,
-                Err(_) => TcpListener::bind("0.0.0.0:0").unwrap(),
+                Err(_) => TcpListener::bind((Ipv6Addr::UNSPECIFIED, 0)).unwrap(),
             };
 
             println!(
@@ -277,7 +277,7 @@ fn handle_client(mut client: TcpStream, brpy: PathBuf) {
                     }
                 }
 
-                let listener = TcpListener::bind("localhost:0").unwrap();
+                let listener = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).unwrap();
                 let port = listener.local_addr().unwrap().port();
 
                 let mut process = process::Command::new("blender")
