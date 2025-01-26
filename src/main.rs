@@ -19,7 +19,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Upload {
-        ip: SocketAddr,
+        ips: String,
         id: String,
         blend: PathBuf,
     },
@@ -78,7 +78,9 @@ fn main() {
     let args = Cli::parse();
 
     match args.command {
-        Command::Upload { ip, id, blend } => {
+        Command::Upload { ips, id, blend } => {
+            let ips = ips.split_terminator(',');
+
             let mut blend = read(blend).unwrap();
             let mut header = serde_json::to_vec(&Request::Upload {
                 id,
@@ -90,24 +92,13 @@ fn main() {
             request.append(&mut header);
             request.append(&mut blend);
 
-            let mut server = TcpStream::connect(ip).unwrap();
-            server.write_all(&request).unwrap();
-
-            let mut len = [0; 1];
-            server.read_exact(&mut len).unwrap();
-
-            let mut header = vec![0; len[0] as usize];
-            server.read_exact(&mut header).unwrap();
-
-            let header: Response = serde_json::from_slice(&header).unwrap();
-            match header {
-                Response::Okay => {
-                    println!("File uploaded successfully");
+            thread::scope(|scope| {
+                for ip in ips {
+                    scope.spawn(|| {
+                        upload(ip, &request);
+                    });
                 }
-                Response::Fail { message } => {
-                    println!("File upload failed\nReason: {}", message);
-                }
-            }
+            });
         }
         Command::Render {
             ip,
@@ -360,5 +351,26 @@ fn handle_client(mut client: TcpStream, brpy: PathBuf) {
         }
 
         initialized = true;
+    }
+}
+
+fn upload(ip: &str, request: &Vec<u8>) {
+    let mut server = TcpStream::connect(ip).unwrap();
+    server.write_all(&request).unwrap();
+
+    let mut len = [0; 1];
+    server.read_exact(&mut len).unwrap();
+
+    let mut header = vec![0; len[0] as usize];
+    server.read_exact(&mut header).unwrap();
+
+    let header: Response = serde_json::from_slice(&header).unwrap();
+    match header {
+        Response::Okay => {
+            println!("File uploaded successfully");
+        }
+        Response::Fail { message } => {
+            println!("File upload failed\nReason: {}", message);
+        }
     }
 }
