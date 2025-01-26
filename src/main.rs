@@ -5,9 +5,11 @@ use std::{
     fs::{create_dir, read, write},
     hash::{DefaultHasher, Hash, Hasher},
     io::{ErrorKind::AlreadyExists, Read, Write},
-    net::{Ipv6Addr, SocketAddr, TcpListener, TcpStream},
+    net::{Ipv6Addr, TcpListener, TcpStream},
     path::PathBuf,
-    process, thread,
+    process,
+    sync::Mutex,
+    thread,
 };
 
 #[derive(Parser)]
@@ -24,7 +26,7 @@ enum Command {
         blend: PathBuf,
     },
     Render {
-        ip: SocketAddr,
+        ips: String,
         output_dir: PathBuf,
         id: String,
         frames: String,
@@ -101,7 +103,7 @@ fn main() {
             });
         }
         Command::Render {
-            ip,
+            ips,
             output_dir,
             id,
             frames,
@@ -129,44 +131,18 @@ fn main() {
 
                 list.sort();
                 list.dedup();
-                list
+                list.reverse();
+
+                Mutex::new(list)
             };
 
-            let mut server = TcpStream::connect(ip).unwrap();
-
-            for frame in frames {
-                let mut header = serde_json::to_vec(&Request::Render {
-                    id: id.clone(),
-                    frame,
-                })
-                .unwrap();
-
-                let mut request = vec![header.len().try_into().unwrap()];
-                request.append(&mut header);
-
-                server.write_all(&request).unwrap();
-
-                let mut len = [0; 1];
-                server.read_exact(&mut len).unwrap();
-
-                let mut header = vec![0; len[0] as usize];
-                server.read_exact(&mut header).unwrap();
-
-                let header = serde_json::from_slice(&header).unwrap();
-                match header {
-                    RenderResponse::Okay { size, extension } => {
-                        let mut image = vec![0; size];
-                        server.read_exact(&mut image).unwrap();
-
-                        let image_name = format!("{:04}.{}", frame, extension);
-                        write(&image_name, image).unwrap();
-                        println!("Saved frame {} as {}", frame, image_name);
-                    }
-                    RenderResponse::Fail => {
-                        todo!();
-                    }
+            thread::scope(|scope| {
+                for ip in ips.split_terminator(',') {
+                    scope.spawn(|| {
+                        render(ip, &id, &frames);
+                    });
                 }
-            }
+            })
         }
         Command::Delete => {
             todo!();
@@ -351,6 +327,51 @@ fn handle_client(mut client: TcpStream, brpy: PathBuf) {
         }
 
         initialized = true;
+    }
+}
+
+fn render(ip: &str, id: &str, frames: &Mutex<Vec<usize>>) {
+    let mut server = TcpStream::connect(ip).unwrap();
+
+    loop {
+        let frame = match frames.lock().unwrap().pop() {
+            None => {
+                return;
+            }
+            Some(frame) => frame,
+        };
+
+        let mut header = serde_json::to_vec(&Request::Render {
+            id: String::from(id),
+            frame,
+        })
+        .unwrap();
+
+        let mut request = vec![header.len().try_into().unwrap()];
+        request.append(&mut header);
+
+        server.write_all(&request).unwrap();
+
+        let mut len = [0; 1];
+        server.read_exact(&mut len).unwrap();
+
+        let mut header = vec![0; len[0] as usize];
+        server.read_exact(&mut header).unwrap();
+
+        let header = serde_json::from_slice(&header).unwrap();
+        match header {
+            RenderResponse::Okay { size, extension } => {
+                let mut image = vec![0; size];
+                server.read_exact(&mut image).unwrap();
+
+                let image_name = format!("{:04}.{}", frame, extension);
+                write(&image_name, image).unwrap();
+                println!("Saved frame {} as {}", frame, image_name);
+            }
+            RenderResponse::Fail => {
+                todo!();
+            }
+        }
     }
 }
 
