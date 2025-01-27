@@ -288,12 +288,7 @@ fn handle_client(mut client: TcpStream, brpy: PathBuf) {
 
                 brpy.write_all(&request).unwrap();
 
-                let mut len = [0; 1];
-                brpy.read_exact(&mut len).unwrap();
-
-                let mut header = vec![0; len[0] as usize];
-                brpy.read_exact(&mut header).unwrap();
-
+                let header = read_header(&mut brpy);
                 let header = serde_json::from_slice(&header).unwrap();
                 match header {
                     BrpyRenderResponse::Okay { image } => {
@@ -352,12 +347,7 @@ fn render(ip: &str, id: &str, frames: &Mutex<Vec<usize>>) {
 
         server.write_all(&request).unwrap();
 
-        let mut len = [0; 1];
-        server.read_exact(&mut len).unwrap();
-
-        let mut header = vec![0; len[0] as usize];
-        server.read_exact(&mut header).unwrap();
-
+        let header = read_header(&mut server);
         let header = serde_json::from_slice(&header).unwrap();
         match header {
             RenderResponse::Okay { size, extension } => {
@@ -379,12 +369,7 @@ fn upload(ip: &str, request: &Vec<u8>) {
     let mut server = TcpStream::connect(ip).unwrap();
     server.write_all(&request).unwrap();
 
-    let mut len = [0; 1];
-    server.read_exact(&mut len).unwrap();
-
-    let mut header = vec![0; len[0] as usize];
-    server.read_exact(&mut header).unwrap();
-
+    let header = read_header(&mut server);
     let header: Response = serde_json::from_slice(&header).unwrap();
     match header {
         Response::Okay => {
@@ -394,4 +379,14 @@ fn upload(ip: &str, request: &Vec<u8>) {
             println!("File upload failed\nReason: {}", message);
         }
     }
+}
+
+fn read_header(stream: &mut TcpStream) -> Vec<u8> {
+    let mut len = [0; 1];
+    stream.read_exact(&mut len).unwrap();
+
+    let mut header = vec![0; len[0] as usize];
+    stream.read_exact(&mut header).unwrap();
+
+    header
 }
