@@ -173,25 +173,27 @@ fn main() {
                 listener.local_addr().unwrap().port()
             );
 
-            for stream in listener.incoming() {
-                match stream {
-                    Ok(stream) => {
-                        let brpy = brpy.clone();
+            let render_lock = Mutex::new(());
 
-                        thread::spawn(move || {
-                            handle_client(stream, brpy);
-                        });
-                    }
-                    Err(error) => {
-                        println!("Failed to establish new connection: {}", error);
+            thread::scope(|scope| {
+                for stream in listener.incoming() {
+                    match stream {
+                        Ok(stream) => {
+                            scope.spawn(|| {
+                                handle_client(stream, &brpy, &render_lock);
+                            });
+                        }
+                        Err(error) => {
+                            println!("Failed to establish new connection: {}", error);
+                        }
                     }
                 }
-            }
+            })
         }
     }
 }
 
-fn handle_client(mut client: TcpStream, brpy: PathBuf) {
+fn handle_client(mut client: TcpStream, brpy: &PathBuf, render_lock: &Mutex<()>) {
     let mut initialized = false;
 
     loop {
@@ -286,9 +288,13 @@ fn handle_client(mut client: TcpStream, brpy: PathBuf) {
                 let mut request = vec![header.len().try_into().unwrap()];
                 request.append(&mut header);
 
-                brpy.write_all(&request).unwrap();
+                let header;
+                {
+                    let _mutex = render_lock.lock().unwrap();
+                    brpy.write_all(&request).unwrap();
+                    header = read_header(&mut brpy);
+                }
 
-                let header = read_header(&mut brpy);
                 let header = serde_json::from_slice(&header).unwrap();
                 match header {
                     BrpyRenderResponse::Okay { image } => {
