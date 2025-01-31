@@ -35,6 +35,9 @@ enum Command {
     Serve {
         brpy: PathBuf,
         work_dir: PathBuf,
+
+        #[arg(short, long)]
+        blender: Option<PathBuf>,
     },
 }
 
@@ -147,10 +150,19 @@ fn main() {
         Command::Delete => {
             todo!();
         }
-        Command::Serve { brpy, work_dir } => {
+        Command::Serve {
+            brpy,
+            work_dir,
+            blender,
+        } => {
             if !brpy.is_file() {
                 panic!("BRPy script {} either does not exist, access is not permitted or it's not a file", brpy.display());
             }
+
+            let blender = match blender {
+                None => PathBuf::from("blender"),
+                Some(blender) => blender.canonicalize().unwrap(),
+            };
 
             set_current_dir(work_dir).unwrap();
 
@@ -180,7 +192,7 @@ fn main() {
                     match stream {
                         Ok(stream) => {
                             scope.spawn(|| {
-                                handle_client(stream, &brpy, &render_lock);
+                                handle_client(stream, &brpy, &render_lock, &blender);
                             });
                         }
                         Err(error) => {
@@ -193,7 +205,12 @@ fn main() {
     }
 }
 
-fn handle_client(mut client: TcpStream, brpy: &PathBuf, render_lock: &Mutex<()>) {
+fn handle_client(
+    mut client: TcpStream,
+    brpy: &PathBuf,
+    render_lock: &Mutex<()>,
+    blender: &PathBuf,
+) {
     let mut initialized = false;
 
     loop {
@@ -265,7 +282,7 @@ fn handle_client(mut client: TcpStream, brpy: &PathBuf, render_lock: &Mutex<()>)
                 let listener = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).unwrap();
                 let port = listener.local_addr().unwrap().port();
 
-                let mut process = process::Command::new("blender")
+                let mut process = process::Command::new(blender)
                     .args([
                         "--background",
                         "--python",
