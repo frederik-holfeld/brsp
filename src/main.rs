@@ -8,6 +8,7 @@ use std::{
     net::{Ipv6Addr, TcpListener, TcpStream},
     path::PathBuf,
     process,
+    process::Child,
     sync::Mutex,
     thread,
 };
@@ -77,6 +78,11 @@ enum BrpyRequest {
 enum BrpyRenderResponse {
     Okay { image: PathBuf },
     Fail,
+}
+
+struct Brpy {
+    stream: TcpStream,
+    process: Child,
 }
 
 fn main() {
@@ -212,6 +218,7 @@ fn handle_client(
     blender: &PathBuf,
 ) {
     let mut initialized = false;
+    let mut brpy_instance: Option<Brpy> = None;
 
     loop {
         let mut len = [0; 1];
@@ -221,6 +228,12 @@ fn handle_client(
             Err(error) => {
                 if initialized {
                     println!("Client disconnected");
+
+                    if let Some(mut instance) = brpy_instance {
+                        let _ = instance.process.kill();
+                        let _ = instance.process.wait();
+                    }
+
                     return;
                 } else {
                     panic!(
@@ -279,21 +292,31 @@ fn handle_client(
                     }
                 }
 
-                let listener = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).unwrap();
-                let port = listener.local_addr().unwrap().port();
+                let brpy_stream: &mut TcpStream = match brpy_instance {
+                    None => {
+                        let listener = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).unwrap();
+                        let port = listener.local_addr().unwrap().port();
 
-                let mut process = process::Command::new(blender)
-                    .args([
-                        "--background",
-                        "--python",
-                        brpy.to_str().unwrap(),
-                        "--",
-                        &port.to_string(),
-                    ])
-                    .spawn()
-                    .unwrap();
+                        let process = process::Command::new(blender)
+                            .args([
+                                "--background",
+                                "--python",
+                                brpy.to_str().unwrap(),
+                                "--",
+                                &port.to_string(),
+                            ])
+                            .spawn()
+                            .unwrap();
 
-                let (mut brpy, _) = listener.accept().unwrap();
+                        brpy_instance = Some(Brpy {
+                            stream: listener.accept().unwrap().0,
+                            process: process,
+                        });
+
+                        &mut brpy_instance.as_mut().unwrap().stream
+                    }
+                    Some(ref mut instance) => &mut instance.stream,
+                };
 
                 let mut header = serde_json::to_vec(&BrpyRequest::Render {
                     blend: format!("anonymous/{0}/{0}.blend", hash).into(),
@@ -308,8 +331,8 @@ fn handle_client(
                 let header;
                 {
                     let _mutex = render_lock.lock().unwrap();
-                    brpy.write_all(&request).unwrap();
-                    header = read_header(&mut brpy);
+                    brpy_stream.write_all(&request).unwrap();
+                    header = read_header(brpy_stream);
                 }
 
                 let header = serde_json::from_slice(&header).unwrap();
@@ -334,8 +357,6 @@ fn handle_client(
                         todo!();
                     }
                 }
-
-                let _ = process.wait();
 
                 println!("Rendered frame {} of \"{}\" sent to client", frame, id);
             }
