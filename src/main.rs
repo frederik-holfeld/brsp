@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::{
     env::set_current_dir,
-    fs::{create_dir, read, write},
+    fs::{create_dir, read, remove_file, write},
     hash::{DefaultHasher, Hash, Hasher},
     io::{ErrorKind::AlreadyExists, Read, Write},
     net::{Ipv6Addr, TcpListener, TcpStream},
@@ -339,19 +339,21 @@ fn handle_client(
                 match header {
                     BrpyRenderResponse::Okay { image } => {
                         let extension = String::from(image.extension().unwrap().to_str().unwrap());
-                        let mut image = read(image).unwrap();
+                        let mut image_data = read(&image).unwrap();
 
                         let mut header = serde_json::to_vec(&RenderResponse::Okay {
-                            size: image.len(),
+                            size: image_data.len(),
                             extension,
                         })
                         .unwrap();
 
                         let mut response = vec![header.len().try_into().unwrap()];
                         response.append(&mut header);
-                        response.append(&mut image);
+                        response.append(&mut image_data);
 
                         client.write_all(&response).unwrap();
+
+                        let _ = remove_file(image);
                     }
                     BrpyRenderResponse::Fail => {
                         todo!();
