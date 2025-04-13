@@ -4,7 +4,7 @@ use std::{
     env::set_current_dir,
     fs::{create_dir, read, remove_file, write},
     hash::{DefaultHasher, Hash, Hasher},
-    io::{ErrorKind::AlreadyExists, Read, Write},
+    io::{ErrorKind, Read, Write},
     net::{Ipv6Addr, TcpListener, TcpStream},
     path::PathBuf,
     process,
@@ -174,7 +174,7 @@ fn main() {
 
             if let Err(error) = create_dir("anonymous") {
                 match error.kind() {
-                    AlreadyExists => {}
+                    ErrorKind::AlreadyExists => {}
                     _ => {
                         panic!("{}", error);
                     }
@@ -285,7 +285,7 @@ fn handle_client(
 
                 if let Err(error) = create_dir(format!("anonymous/{}/render", hash)) {
                     match error.kind() {
-                        AlreadyExists => {}
+                        ErrorKind::AlreadyExists => {}
                         _ => {
                             panic!("{}", error);
                         }
@@ -372,7 +372,7 @@ fn handle_client(
 }
 
 fn render(ip: &str, id: &str, frames: &Mutex<Vec<usize>>) {
-    let mut server = TcpStream::connect(ip).unwrap();
+    let mut server = connect(ip);
 
     loop {
         let frame = match frames.lock().unwrap().pop() {
@@ -412,7 +412,7 @@ fn render(ip: &str, id: &str, frames: &Mutex<Vec<usize>>) {
 }
 
 fn upload(ip: &str, request: &Vec<u8>) {
-    let mut server = TcpStream::connect(ip).unwrap();
+    let mut server = connect(ip);
     server.write_all(&request).unwrap();
 
     let header = read_header(&mut server);
@@ -435,4 +435,16 @@ fn read_header(stream: &mut TcpStream) -> Vec<u8> {
     stream.read_exact(&mut header).unwrap();
 
     header
+}
+
+fn connect(ip: &str) -> TcpStream {
+    match TcpStream::connect(ip) {
+        Ok(stream) => stream,
+        Err(error) => match error.kind() {
+            ErrorKind::InvalidInput => TcpStream::connect((ip, 21816)).unwrap(),
+            _ => {
+                panic!("{:?}", error);
+            }
+        },
+    }
 }
