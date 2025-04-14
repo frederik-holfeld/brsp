@@ -330,7 +330,7 @@ fn handle_client(
 
                 let header;
                 {
-                    let _mutex = render_lock.lock().unwrap();
+                    let _mutex = render_lock.lock();
                     brpy_stream.write_all(&request).unwrap();
                     header = read_header(brpy_stream);
                 }
