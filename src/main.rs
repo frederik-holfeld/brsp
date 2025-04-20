@@ -6,7 +6,7 @@ use std::{
     hash::{DefaultHasher, Hash, Hasher},
     io::{ErrorKind, Read, Write},
     net::{Ipv6Addr, TcpListener, TcpStream},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process,
     process::Child,
     sync::Mutex,
@@ -40,6 +40,9 @@ enum Command {
         #[arg(short, long)]
         blender: Option<PathBuf>,
     },
+    Query {
+        ips: String,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -48,6 +51,7 @@ enum Request {
     Upload { id: String, size: usize },
     Render { id: String, frame: usize },
     Delete,
+    Query,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -63,6 +67,19 @@ enum RenderResponse {
     Fail,
 }
 
+#[derive(Serialize, Deserialize)]
+struct QueryResponse {
+    version: [u8; 3],
+    compute_device_type: String,
+    devices: ComputeDeviceList,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct ComputeDeviceList {
+    active: Vec<String>,
+    inactive: Vec<String>,
+}
+
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 enum BrpyRequest {
@@ -71,6 +88,7 @@ enum BrpyRequest {
         frame: usize,
         output: PathBuf,
     },
+    Query,
 }
 
 #[derive(Deserialize)]
@@ -93,14 +111,13 @@ fn main() {
             let ips = ips.split_terminator(',');
 
             let mut blend = read(blend).unwrap();
-            let mut header = serde_json::to_vec(&Request::Upload {
-                id,
-                size: blend.len(),
-            })
-            .unwrap();
-
-            let mut request = vec![header.len().try_into().unwrap()];
-            request.append(&mut header);
+            let mut request = to_header(
+                serde_json::to_vec(&Request::Upload {
+                    id,
+                    size: blend.len(),
+                })
+                .unwrap(),
+            );
             request.append(&mut blend);
 
             thread::scope(|scope| {
@@ -156,6 +173,17 @@ fn main() {
         Command::Delete => {
             todo!();
         }
+        Command::Query { ips } => {
+            let header = to_header(serde_json::to_vec(&Request::Query).unwrap());
+
+            thread::scope(|scope| {
+                for ip in ips.split_terminator(',') {
+                    scope.spawn(|| {
+                        query(ip, &header);
+                    });
+                }
+            });
+        }
         Command::Serve {
             brpy,
             work_dir,
@@ -193,12 +221,26 @@ fn main() {
 
             let render_lock = Mutex::new(());
 
+            let info: QueryResponse = {
+                let (mut stream, mut process) = spawn_brpy(&blender, &brpy);
+
+                let request = to_header(serde_json::to_vec(&BrpyRequest::Query).unwrap());
+                stream.write_all(&request).unwrap();
+
+                let response = read_header(&mut stream);
+
+                let _ = process.kill();
+                let _ = process.wait();
+
+                serde_json::from_slice(&response).unwrap()
+            };
+
             thread::scope(|scope| {
                 for stream in listener.incoming() {
                     match stream {
                         Ok(stream) => {
                             scope.spawn(|| {
-                                handle_client(stream, &brpy, &render_lock, &blender);
+                                handle_client(stream, &brpy, &render_lock, &blender, &info);
                             });
                         }
                         Err(error) => {
@@ -213,18 +255,19 @@ fn main() {
 
 fn handle_client(
     mut client: TcpStream,
-    brpy: &PathBuf,
+    brpy: &Path,
     render_lock: &Mutex<()>,
-    blender: &PathBuf,
+    blender: &Path,
+    info: &QueryResponse,
 ) {
     let mut initialized = false;
     let mut brpy_instance: Option<Brpy> = None;
 
     loop {
-        let mut len = [0; 1];
+        let header = read_header(&mut client);
 
-        match client.read_exact(&mut len) {
-            Ok(_) => {}
+        let request: Request = match serde_json::from_slice(&header) {
+            Ok(request) => request,
             Err(error) => {
                 if initialized {
                     println!("Client disconnected");
@@ -242,13 +285,9 @@ fn handle_client(
                     );
                 }
             }
-        }
+        };
 
-        let mut header = vec![0; len[0] as usize];
-        client.read_exact(&mut header).unwrap();
-        let header: Request = serde_json::from_slice(&header).unwrap();
-
-        match header {
+        match request {
             Request::Upload { id, size } => {
                 let mut blend = vec![0; size];
                 client.read_exact(&mut blend).unwrap();
@@ -257,22 +296,16 @@ fn handle_client(
                 id.hash(&mut hasher);
                 let hash = hasher.finish();
 
-                let mut header;
                 let _ = create_dir(format!("anonymous/{}", hash));
-                match write(format!("anonymous/{0}/{0}.blend", hash), blend) {
-                    Ok(()) => {
-                        header = serde_json::to_vec(&Response::Okay).unwrap();
-                    }
-                    Err(_) => {
-                        header = serde_json::to_vec(&Response::Fail {
-                            message: "Could not save file".to_string(),
-                        })
-                        .unwrap();
-                    }
-                }
+                let header = match write(format!("anonymous/{0}/{0}.blend", hash), blend) {
+                    Ok(()) => serde_json::to_vec(&Response::Okay).unwrap(),
+                    Err(_) => serde_json::to_vec(&Response::Fail {
+                        message: "Could not save file".to_string(),
+                    })
+                    .unwrap(),
+                };
 
-                let mut response = vec![header.len().try_into().unwrap()];
-                response.append(&mut header);
+                let response = to_header(header);
                 client.write_all(&response).unwrap();
 
                 println!("Saved .blend file with ID \"{}\"", id);
@@ -294,39 +327,23 @@ fn handle_client(
 
                 let brpy_stream: &mut TcpStream = match brpy_instance {
                     None => {
-                        let listener = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).unwrap();
-                        let port = listener.local_addr().unwrap().port();
+                        let (stream, process) = spawn_brpy(blender, brpy);
 
-                        let process = process::Command::new(blender)
-                            .args([
-                                "--background",
-                                "--python",
-                                brpy.to_str().unwrap(),
-                                "--",
-                                &port.to_string(),
-                            ])
-                            .spawn()
-                            .unwrap();
-
-                        brpy_instance = Some(Brpy {
-                            stream: listener.accept().unwrap().0,
-                            process: process,
-                        });
+                        brpy_instance = Some(Brpy { stream, process });
 
                         &mut brpy_instance.as_mut().unwrap().stream
                     }
                     Some(ref mut instance) => &mut instance.stream,
                 };
 
-                let mut header = serde_json::to_vec(&BrpyRequest::Render {
-                    blend: format!("anonymous/{0}/{0}.blend", hash).into(),
-                    frame,
-                    output: format!("anonymous/{}/render", hash).into(),
-                })
-                .unwrap();
-
-                let mut request = vec![header.len().try_into().unwrap()];
-                request.append(&mut header);
+                let request = to_header(
+                    serde_json::to_vec(&BrpyRequest::Render {
+                        blend: format!("anonymous/{0}/{0}.blend", hash).into(),
+                        frame,
+                        output: format!("anonymous/{}/render", hash).into(),
+                    })
+                    .unwrap(),
+                );
 
                 let header;
                 {
@@ -341,16 +358,14 @@ fn handle_client(
                         let extension = String::from(image.extension().unwrap().to_str().unwrap());
                         let mut image_data = read(&image).unwrap();
 
-                        let mut header = serde_json::to_vec(&RenderResponse::Okay {
-                            size: image_data.len(),
-                            extension,
-                        })
-                        .unwrap();
-
-                        let mut response = vec![header.len().try_into().unwrap()];
-                        response.append(&mut header);
+                        let mut response = to_header(
+                            serde_json::to_vec(&RenderResponse::Okay {
+                                size: image_data.len(),
+                                extension,
+                            })
+                            .unwrap(),
+                        );
                         response.append(&mut image_data);
-
                         client.write_all(&response).unwrap();
 
                         let _ = remove_file(image);
@@ -364,6 +379,18 @@ fn handle_client(
             }
             Request::Delete => {
                 todo!();
+            }
+            Request::Query => {
+                let response = to_header(
+                    serde_json::to_vec(&QueryResponse {
+                        version: info.version,
+                        compute_device_type: info.compute_device_type.clone(),
+                        devices: info.devices.clone(),
+                    })
+                    .unwrap(),
+                );
+
+                client.write_all(&response).unwrap();
             }
         }
 
@@ -382,19 +409,18 @@ fn render(ip: &str, id: &str, frames: &Mutex<Vec<usize>>) {
             Some(frame) => frame,
         };
 
-        let mut header = serde_json::to_vec(&Request::Render {
-            id: String::from(id),
-            frame,
-        })
-        .unwrap();
-
-        let mut request = vec![header.len().try_into().unwrap()];
-        request.append(&mut header);
-
+        let request = to_header(
+            serde_json::to_vec(&Request::Render {
+                id: String::from(id),
+                frame,
+            })
+            .unwrap(),
+        );
         server.write_all(&request).unwrap();
 
         let header = read_header(&mut server);
         let header = serde_json::from_slice(&header).unwrap();
+
         match header {
             RenderResponse::Okay { size, extension } => {
                 let mut image = vec![0; size];
@@ -411,12 +437,13 @@ fn render(ip: &str, id: &str, frames: &Mutex<Vec<usize>>) {
     }
 }
 
-fn upload(ip: &str, request: &Vec<u8>) {
+fn upload(ip: &str, request: &[u8]) {
     let mut server = connect(ip);
-    server.write_all(&request).unwrap();
+    server.write_all(request).unwrap();
 
     let header = read_header(&mut server);
     let header: Response = serde_json::from_slice(&header).unwrap();
+
     match header {
         Response::Okay => {
             println!("File uploaded successfully");
@@ -428,11 +455,18 @@ fn upload(ip: &str, request: &Vec<u8>) {
 }
 
 fn read_header(stream: &mut TcpStream) -> Vec<u8> {
-    let mut len = [0; 1];
+    let mut len = [0; 2];
     stream.read_exact(&mut len).unwrap();
 
-    let mut header = vec![0; len[0] as usize];
+    let mut header = vec![0; u16::from_le_bytes(len) as usize];
     stream.read_exact(&mut header).unwrap();
+
+    header
+}
+
+fn to_header(mut content: Vec<u8>) -> Vec<u8> {
+    let mut header = u16::try_from(content.len()).unwrap().to_le_bytes().to_vec();
+    header.append(&mut content);
 
     header
 }
@@ -447,4 +481,60 @@ fn connect(ip: &str) -> TcpStream {
             }
         },
     }
+}
+
+fn query(ip: &str, request: &[u8]) {
+    let mut server = connect(ip);
+    server.write_all(request).unwrap();
+
+    let header = read_header(&mut server);
+    let header: QueryResponse = serde_json::from_slice(&header).unwrap();
+
+    let mut output = format!(
+        "{}:\n    Blender version: {}.{}.{}\n    Compute device type: {}",
+        ip, header.version[0], header.version[1], header.version[2], header.compute_device_type
+    );
+
+    let active_not_empty = !header.devices.active.is_empty();
+    let inactive_not_empty = !header.devices.inactive.is_empty();
+
+    if active_not_empty || inactive_not_empty {
+        output += "\n    Devices:";
+
+        if active_not_empty {
+            output += "\n        Active:";
+            for device in header.devices.active {
+                output += &format!("\n            {}", device);
+            }
+        }
+
+        if inactive_not_empty {
+            output += "\n        Inactive:";
+            for device in header.devices.inactive {
+                output += &format!("\n            {}", device);
+            }
+        }
+    }
+
+    println!("{}", output);
+}
+
+fn spawn_brpy(blender: &Path, brpy: &Path) -> (TcpStream, Child) {
+    let listener = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let process = process::Command::new(blender)
+        .args([
+            "--background",
+            "--python",
+            brpy.to_str().unwrap(),
+            "--",
+            &port.to_string(),
+        ])
+        .spawn()
+        .unwrap();
+
+    let stream = listener.accept().unwrap().0;
+
+    (stream, process)
 }
