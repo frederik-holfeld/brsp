@@ -49,9 +49,15 @@ enum Command {
 #[serde(tag = "type", rename_all = "lowercase")]
 enum Request {
     Upload { id: String, size: usize },
-    Render { id: String, frame: usize },
+    Render,
     Delete,
     Query,
+}
+
+#[derive(Serialize, Deserialize)]
+struct FrameRequest {
+    id: String,
+    frame: usize,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -59,6 +65,12 @@ enum Request {
 enum Response {
     Okay,
     Fail { message: String },
+}
+
+#[derive(Serialize, Deserialize)]
+enum RenderAcceptResponse {
+    Accept,
+    Reject,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -311,20 +323,7 @@ fn handle_client(
                 println!("Saved .blend file with ID \"{}\"", id);
                 break;
             }
-            Request::Render { id, frame } => {
-                let mut hasher = DefaultHasher::new();
-                id.hash(&mut hasher);
-                let hash = hasher.finish();
-
-                if let Err(error) = create_dir(format!("anonymous/{}/render", hash)) {
-                    match error.kind() {
-                        ErrorKind::AlreadyExists => {}
-                        _ => {
-                            panic!("{}", error);
-                        }
-                    }
-                }
-
+            Request::Render => {
                 let brpy_stream: &mut TcpStream = match brpy_instance {
                     None => {
                         let (stream, process) = spawn_brpy(blender, brpy);
@@ -336,21 +335,41 @@ fn handle_client(
                     Some(ref mut instance) => &mut instance.stream,
                 };
 
-                let request = to_header(
-                    serde_json::to_vec(&BrpyRequest::Render {
-                        blend: format!("anonymous/{0}/{0}.blend", hash).into(),
-                        frame,
-                        output: format!("anonymous/{}/render", hash).into(),
-                    })
-                    .unwrap(),
-                );
-
-                let header;
-                {
+                let render_request: FrameRequest;
+                let header = {
                     let _mutex = render_lock.lock();
+
+                    let response =
+                        to_header(serde_json::to_vec(&RenderAcceptResponse::Accept).unwrap());
+                    client.write_all(&response).unwrap();
+
+                    render_request = serde_json::from_slice(&read_header(&mut client)).unwrap();
+
+                    let mut hasher = DefaultHasher::new();
+                    render_request.id.hash(&mut hasher);
+                    let hash = hasher.finish();
+
+                    if let Err(error) = create_dir(format!("anonymous/{}/render", hash)) {
+                        match error.kind() {
+                            ErrorKind::AlreadyExists => {}
+                            _ => {
+                                panic!("{}", error);
+                            }
+                        }
+                    }
+
+                    let request = to_header(
+                        serde_json::to_vec(&BrpyRequest::Render {
+                            blend: format!("anonymous/{0}/{0}.blend", hash).into(),
+                            frame: render_request.frame,
+                            output: format!("anonymous/{}/render", hash).into(),
+                        })
+                        .unwrap(),
+                    );
+
                     brpy_stream.write_all(&request).unwrap();
-                    header = read_header(brpy_stream);
-                }
+                    read_header(brpy_stream)
+                };
 
                 let header = serde_json::from_slice(&header).unwrap();
                 match header {
@@ -375,7 +394,10 @@ fn handle_client(
                     }
                 }
 
-                println!("Rendered frame {} of \"{}\" sent to client", frame, id);
+                println!(
+                    "Rendered frame {} of \"{}\" sent to client",
+                    render_request.frame, render_request.id
+                );
             }
             Request::Delete => {
                 todo!();
@@ -402,35 +424,50 @@ fn render(ip: &str, id: &str, frames: &Mutex<Vec<usize>>) {
     let mut server = connect(ip);
 
     loop {
-        let frame = match frames.lock().unwrap().pop() {
-            None => {
-                return;
-            }
-            Some(frame) => frame,
-        };
-
-        let request = to_header(
-            serde_json::to_vec(&Request::Render {
-                id: String::from(id),
-                frame,
-            })
-            .unwrap(),
-        );
+        let request = to_header(serde_json::to_vec(&Request::Render).unwrap());
         server.write_all(&request).unwrap();
 
-        let header = read_header(&mut server);
-        let header = serde_json::from_slice(&header).unwrap();
+        let response = read_header(&mut server);
+        let response = serde_json::from_slice(&response).unwrap();
 
-        match header {
-            RenderResponse::Okay { size, extension } => {
-                let mut image = vec![0; size];
-                server.read_exact(&mut image).unwrap();
+        match response {
+            RenderAcceptResponse::Accept => {
+                println!("Render request accepted");
 
-                let image_name = format!("{:04}.{}", frame, extension);
-                write(&image_name, image).unwrap();
-                println!("Saved frame {} as {}", frame, image_name);
+                let frame = match frames.lock().unwrap().pop() {
+                    None => {
+                        return;
+                    }
+                    Some(frame) => frame,
+                };
+
+                let request = to_header(
+                    serde_json::to_vec(&FrameRequest {
+                        id: String::from(id),
+                        frame,
+                    })
+                    .unwrap(),
+                );
+                server.write_all(&request).unwrap();
+
+                let header = read_header(&mut server);
+                let header = serde_json::from_slice(&header).unwrap();
+
+                match header {
+                    RenderResponse::Okay { size, extension } => {
+                        let mut image = vec![0; size];
+                        server.read_exact(&mut image).unwrap();
+
+                        let image_name = format!("{:04}.{}", frame, extension);
+                        write(&image_name, image).unwrap();
+                        println!("Saved frame {} as {}", frame, image_name);
+                    }
+                    RenderResponse::Fail => {
+                        todo!();
+                    }
+                }
             }
-            RenderResponse::Fail => {
+            RenderAcceptResponse::Reject => {
                 todo!();
             }
         }
