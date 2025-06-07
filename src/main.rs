@@ -6,10 +6,9 @@ use std::{
     hash::{DefaultHasher, Hash, Hasher},
     io::{ErrorKind, Read, Write},
     net::{Ipv6Addr, TcpListener, TcpStream},
-    path::{Path, PathBuf},
+    path::PathBuf,
     process,
-    process::Child,
-    sync::Mutex,
+    sync::{Condvar, Mutex},
     thread,
 };
 
@@ -108,11 +107,6 @@ enum BrpyRequest {
 enum BrpyRenderResponse {
     Okay { image: PathBuf },
     Fail,
-}
-
-struct Brpy {
-    stream: TcpStream,
-    process: Child,
 }
 
 fn main() {
@@ -226,33 +220,49 @@ fn main() {
                 Err(_) => TcpListener::bind((Ipv6Addr::UNSPECIFIED, 0)).unwrap(),
             };
 
-            println!(
-                "Listening on port {}",
-                listener.local_addr().unwrap().port()
-            );
+            let mut brpy = {
+                let listener = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).unwrap();
+                let port = listener.local_addr().unwrap().port();
 
-            let render_lock = Mutex::new(());
+                process::Command::new(blender)
+                    .args([
+                        "--background",
+                        "--python",
+                        brpy.to_str().unwrap(),
+                        "--",
+                        &port.to_string(),
+                    ])
+                    .spawn()
+                    .unwrap();
 
-            let info: QueryResponse = {
-                let (mut stream, mut process) = spawn_brpy(&blender, &brpy);
-
-                let request = to_header(serde_json::to_vec(&BrpyRequest::Query).unwrap());
-                stream.write_all(&request).unwrap();
-
-                let response = read_header(&mut stream);
-
-                let _ = process.kill();
-                let _ = process.wait();
-
-                serde_json::from_slice(&response).unwrap()
+                listener.accept().unwrap().0
             };
 
+            let info: QueryResponse = {
+                let request = to_header(serde_json::to_vec(&BrpyRequest::Query).unwrap());
+                brpy.write_all(&request).unwrap();
+
+                serde_json::from_slice(&read_header(&mut brpy).unwrap()).unwrap()
+            };
+
+            let render_requesters: Mutex<Vec<Option<TcpStream>>> = Mutex::new(vec![None]);
+            let notifier = Condvar::new();
+
             thread::scope(|scope| {
+                scope.spawn(|| {
+                    worker_brpy(brpy, &render_requesters, &notifier);
+                });
+
+                println!(
+                    "Listening on port {}",
+                    listener.local_addr().unwrap().port()
+                );
+
                 for stream in listener.incoming() {
                     match stream {
                         Ok(stream) => {
                             scope.spawn(|| {
-                                handle_client(stream, &brpy, &render_lock, &blender, &info);
+                                handle_client(stream, &info, &render_requesters, &notifier);
                             });
                         }
                         Err(error) => {
@@ -267,37 +277,12 @@ fn main() {
 
 fn handle_client(
     mut client: TcpStream,
-    brpy: &Path,
-    render_lock: &Mutex<()>,
-    blender: &Path,
     info: &QueryResponse,
+    render_requesters: &Mutex<Vec<Option<TcpStream>>>,
+    notifier: &Condvar,
 ) {
-    let mut initialized = false;
-    let mut brpy_instance: Option<Brpy> = None;
-
     loop {
-        let header = read_header(&mut client);
-
-        let request: Request = match serde_json::from_slice(&header) {
-            Ok(request) => request,
-            Err(error) => {
-                if initialized {
-                    println!("Client disconnected");
-
-                    if let Some(mut instance) = brpy_instance {
-                        let _ = instance.process.kill();
-                        let _ = instance.process.wait();
-                    }
-
-                    return;
-                } else {
-                    panic!(
-                        "Connection broken right after it was established: {}",
-                        error
-                    );
-                }
-            }
-        };
+        let request = serde_json::from_slice(&read_header(&mut client).unwrap()).unwrap();
 
         match request {
             Request::Upload { id, size } => {
@@ -324,80 +309,35 @@ fn handle_client(
                 break;
             }
             Request::Render => {
-                let brpy_stream: &mut TcpStream = match brpy_instance {
-                    None => {
-                        let (stream, process) = spawn_brpy(blender, brpy);
+                let requester = Some(client);
 
-                        brpy_instance = Some(Brpy { stream, process });
+                let mut free_slot = 0;
+                let mut free_slot_found = false;
 
-                        &mut brpy_instance.as_mut().unwrap().stream
-                    }
-                    Some(ref mut instance) => &mut instance.stream,
-                };
+                {
+                    let mut render_requesters = render_requesters.lock().unwrap();
+                    let len = render_requesters.len();
 
-                let render_request: FrameRequest;
-                let header = {
-                    let _mutex = render_lock.lock();
-
-                    let response =
-                        to_header(serde_json::to_vec(&RenderAcceptResponse::Accept).unwrap());
-                    client.write_all(&response).unwrap();
-
-                    render_request = serde_json::from_slice(&read_header(&mut client)).unwrap();
-
-                    let mut hasher = DefaultHasher::new();
-                    render_request.id.hash(&mut hasher);
-                    let hash = hasher.finish();
-
-                    if let Err(error) = create_dir(format!("anonymous/{}/render", hash)) {
-                        match error.kind() {
-                            ErrorKind::AlreadyExists => {}
-                            _ => {
-                                panic!("{}", error);
-                            }
+                    for slot in 0..len {
+                        if render_requesters[slot].is_none() {
+                            free_slot_found = true;
+                            free_slot = slot;
+                            break;
                         }
                     }
 
-                    let request = to_header(
-                        serde_json::to_vec(&BrpyRequest::Render {
-                            blend: format!("anonymous/{0}/{0}.blend", hash).into(),
-                            frame: render_request.frame,
-                            output: format!("anonymous/{}/render", hash).into(),
-                        })
-                        .unwrap(),
-                    );
-
-                    brpy_stream.write_all(&request).unwrap();
-                    read_header(brpy_stream)
-                };
-
-                let header = serde_json::from_slice(&header).unwrap();
-                match header {
-                    BrpyRenderResponse::Okay { image } => {
-                        let extension = String::from(image.extension().unwrap().to_str().unwrap());
-                        let mut image_data = read(&image).unwrap();
-
-                        let mut response = to_header(
-                            serde_json::to_vec(&RenderResponse::Okay {
-                                size: image_data.len(),
-                                extension,
-                            })
-                            .unwrap(),
-                        );
-                        response.append(&mut image_data);
-                        client.write_all(&response).unwrap();
-
-                        let _ = remove_file(image);
-                    }
-                    BrpyRenderResponse::Fail => {
-                        todo!();
+                    if free_slot_found {
+                        render_requesters[free_slot] = requester;
+                        println!("Put new render requester in slot {}", free_slot);
+                    } else {
+                        render_requesters.push(requester);
+                        println!("Created render slot {} for new render requester", len);
                     }
                 }
 
-                println!(
-                    "Rendered frame {} of \"{}\" sent to client",
-                    render_request.frame, render_request.id
-                );
+                notifier.notify_all();
+
+                return;
             }
             Request::Delete => {
                 todo!();
@@ -415,19 +355,21 @@ fn handle_client(
                 client.write_all(&response).unwrap();
             }
         }
-
-        initialized = true;
     }
 }
 
 fn render(ip: &str, id: &str, frames: &Mutex<Vec<usize>>) {
     let mut server = connect(ip);
 
-    loop {
-        let request = to_header(serde_json::to_vec(&Request::Render).unwrap());
-        server.write_all(&request).unwrap();
+    let request = to_header(serde_json::to_vec(&Request::Render).unwrap());
+    server.write_all(&request).unwrap();
 
-        let response = read_header(&mut server);
+    loop {
+        if frames.lock().unwrap().is_empty() {
+            return;
+        }
+
+        let response = read_header(&mut server).unwrap();
         let response = serde_json::from_slice(&response).unwrap();
 
         match response {
@@ -450,7 +392,7 @@ fn render(ip: &str, id: &str, frames: &Mutex<Vec<usize>>) {
                 );
                 server.write_all(&request).unwrap();
 
-                let header = read_header(&mut server);
+                let header = read_header(&mut server).unwrap();
                 let header = serde_json::from_slice(&header).unwrap();
 
                 match header {
@@ -478,7 +420,7 @@ fn upload(ip: &str, request: &[u8]) {
     let mut server = connect(ip);
     server.write_all(request).unwrap();
 
-    let header = read_header(&mut server);
+    let header = read_header(&mut server).unwrap();
     let header: Response = serde_json::from_slice(&header).unwrap();
 
     match header {
@@ -491,14 +433,14 @@ fn upload(ip: &str, request: &[u8]) {
     }
 }
 
-fn read_header(stream: &mut TcpStream) -> Vec<u8> {
+fn read_header(stream: &mut TcpStream) -> Result<Vec<u8>, std::io::Error> {
     let mut len = [0; 2];
-    stream.read_exact(&mut len).unwrap();
+    stream.read_exact(&mut len)?;
 
     let mut header = vec![0; u16::from_le_bytes(len) as usize];
-    stream.read_exact(&mut header).unwrap();
+    stream.read_exact(&mut header)?;
 
-    header
+    Ok(header)
 }
 
 fn to_header(mut content: Vec<u8>) -> Vec<u8> {
@@ -524,7 +466,7 @@ fn query(ip: &str, request: &[u8]) {
     let mut server = connect(ip);
     server.write_all(request).unwrap();
 
-    let header = read_header(&mut server);
+    let header = read_header(&mut server).unwrap();
     let header: QueryResponse = serde_json::from_slice(&header).unwrap();
 
     let mut output = format!(
@@ -556,22 +498,112 @@ fn query(ip: &str, request: &[u8]) {
     println!("{}", output);
 }
 
-fn spawn_brpy(blender: &Path, brpy: &Path) -> (TcpStream, Child) {
-    let listener = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).unwrap();
-    let port = listener.local_addr().unwrap().port();
+fn worker_brpy(
+    mut brpy: TcpStream,
+    requesters: &Mutex<Vec<Option<TcpStream>>>,
+    notifier: &Condvar,
+) {
+    let mut slot = 0;
 
-    let process = process::Command::new(blender)
-        .args([
-            "--background",
-            "--python",
-            brpy.to_str().unwrap(),
-            "--",
-            &port.to_string(),
-        ])
-        .spawn()
-        .unwrap();
+    'outer: loop {
+        let frame_request: FrameRequest = {
+            let old_slot = slot;
+            let mut requesters = requesters.lock().unwrap();
 
-    let stream = listener.accept().unwrap().0;
+            let frame_request = {
+                let len = requesters.len();
+                let client = loop {
+                    slot = (slot + 1) % len;
+                    match &mut requesters[slot] {
+                        None => {
+                            if slot == old_slot {
+                                println!("Awaiting further render requests");
+                                let _requesters = notifier.wait(requesters).unwrap();
+                                continue 'outer;
+                            }
+                        }
+                        Some(requester) => {
+                            break requester;
+                        }
+                    }
+                };
 
-    (stream, process)
+                let request = to_header(serde_json::to_vec(&RenderAcceptResponse::Accept).unwrap());
+                let _ = client.write_all(&request);
+
+                read_header(client)
+            };
+
+            match frame_request {
+                Err(_) => {
+                    requesters[slot] = None;
+                    continue;
+                }
+                Ok(frame_request) => serde_json::from_slice(&frame_request).unwrap(),
+            }
+        };
+
+        println!("Rendering slot {}", slot);
+
+        let mut hasher = DefaultHasher::new();
+        frame_request.id.hash(&mut hasher);
+        let hash = hasher.finish();
+
+        if let Err(error) = create_dir(format!("anonymous/{}/render", hash)) {
+            match error.kind() {
+                ErrorKind::AlreadyExists => {}
+                _ => {
+                    panic!("{}", error);
+                }
+            }
+        }
+
+        let request = to_header(
+            serde_json::to_vec(&BrpyRequest::Render {
+                blend: format!("anonymous/{0}/{0}.blend", hash).into(),
+                frame: frame_request.frame,
+                output: format!("anonymous/{}/render", hash).into(),
+            })
+            .unwrap(),
+        );
+
+        brpy.write_all(&request).unwrap();
+        let response = serde_json::from_slice(&read_header(&mut brpy).unwrap()).unwrap();
+
+        match response {
+            BrpyRenderResponse::Okay { image } => {
+                let extension = String::from(image.extension().unwrap().to_str().unwrap());
+                let mut image_data = read(&image).unwrap();
+
+                let mut response = to_header(
+                    serde_json::to_vec(&RenderResponse::Okay {
+                        size: image_data.len(),
+                        extension,
+                    })
+                    .unwrap(),
+                );
+                response.append(&mut image_data);
+
+                {
+                    let mut requesters = requesters.lock().unwrap();
+                    let client = &mut requesters[slot].as_ref().unwrap();
+
+                    if { client.write_all(&response) }.is_err() {
+                        println!("Cannot reach client, discarding frame");
+                        requesters[slot] = None;
+                    } else {
+                        println!(
+                            "Rendered frame {} of \"{}\" sent to client",
+                            frame_request.frame, frame_request.id
+                        );
+                    }
+                }
+
+                let _ = remove_file(image);
+            }
+            BrpyRenderResponse::Fail => {
+                todo!();
+            }
+        }
+    }
 }
