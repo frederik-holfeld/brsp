@@ -552,18 +552,22 @@ fn worker_brpy(
         frame_request.id.hash(&mut hasher);
         let hash = hasher.finish();
 
-        if let Err(error) = create_dir(format!("anonymous/{}/render", hash)) {
-            match error.kind() {
-                ErrorKind::AlreadyExists => {}
-                _ => {
-                    panic!("{}", error);
-                }
-            }
+        let blend = PathBuf::from(format!("anonymous/{0}/{0}.blend", hash));
+        if !blend.is_file() {
+            println!("No .blend file found for ID \"{}\"", frame_request.id);
+
+            let response = to_header(serde_json::to_vec(&RenderResponse::Fail).unwrap());
+
+            let requesters = &mut requesters.lock().unwrap();
+            let client = requesters[slot].as_mut().unwrap();
+            let _ = client.write_all(&response);
+
+            continue;
         }
 
         let request = to_header(
             serde_json::to_vec(&BrpyRequest::Render {
-                blend: format!("anonymous/{0}/{0}.blend", hash).into(),
+                blend,
                 frame: frame_request.frame,
                 output: format!("anonymous/{}/render", hash).into(),
             })
