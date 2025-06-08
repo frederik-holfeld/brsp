@@ -196,7 +196,10 @@ fn main() {
             blender,
         } => {
             if !brpy.is_file() {
-                panic!("BRPy script {} either does not exist, access is not permitted or it's not a file", brpy.display());
+                panic!(
+                    "BRPy script {} either does not exist, access is not permitted or it's not a file",
+                    brpy.display()
+                );
             }
 
             let blender = match blender {
